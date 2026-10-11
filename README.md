@@ -221,8 +221,9 @@ format (`tests/support/aup_fixture.rs`): a project must master sample-for-sample
 like the same audio as a WAV, and the project file must be left byte-identical.
 They are skipped when `ffmpeg` is not installed.
 
-Design history: `docs/2026-06-15-design.md`. The audit that led to the
-current chain: `docs/2026-10-11-mastering-fix-plan.md`.
+What the technique is based on, with sources: `docs/research.md`. Design history:
+`docs/2026-06-15-design.md`. The audit that led to the current chain:
+`docs/2026-10-11-mastering-fix-plan.md`.
 
 ## Licence
 
