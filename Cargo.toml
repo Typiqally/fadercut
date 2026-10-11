@@ -1,0 +1,22 @@
+[package]
+name = "fadercut"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+description = "Master a DJ set: even out loudness, tame spikes, hit a target."
+license = "MIT"
+repository = "https://github.com/Typiqally/fadercut"
+readme = "README.md"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tempfile = "3"
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
