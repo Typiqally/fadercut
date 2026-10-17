@@ -160,7 +160,7 @@ preflight check. Nothing is written in either failure case.
 | `--bass-mono [HZ]` | fold lows below HZ (default 120) to mono |
 | `--subsonic [HZ]` | high-pass below HZ (default 28) to remove inaudible rumble |
 | `--preview START-END` | process only a time range to audition fast (e.g. `0:30-1:30`, `1:02:50-1:03:20`) |
-| `--target`   | Override integrated loudness (LUFS) |
+| `--target`   | Override integrated loudness (LUFS), or `max`: the loudest the set goes with the limiter taking at most 0.5 LU |
 | `--tp`       | Override the true-peak ceiling (dBTP, -20 to 0), default -1 |
 | `--output`   | Output path (default `<input>-mastered.wav`, or `-preview.wav`) |
 | `--force`   | Overwrite existing output |
@@ -198,6 +198,11 @@ decoding again. Above 0 dBTP a decoder with fixed-point output clips.
   the transcode.
 - On platforms that play files at their own level, louder does play louder. Around
   −11 LUFS is the most this material gives before the limiter starts to work.
+- `--target max` finds that point for each set instead of guessing it: it renders,
+  measures what the limiter took, and narrows in on the highest gain where the
+  limiter takes at most 0.5 LU (between the ~0.3 LU that measured clean and the
+  ~1.2 LU that pumped). Each step is a full render, so expect 3–6 passes. On a
+  63-minute hard-groove set it landed at −10.3 LUFS in 3 passes.
 - `--bass-mono` and `--subsonic` rotate phase, which raises peaks by a dB or two on
   mastered material; at loud targets that is paid for in limiting (1.2 LU at −9 LUFS
   on the test set, 0.1 LU at −11).

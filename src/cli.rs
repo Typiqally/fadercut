@@ -29,6 +29,15 @@ impl Leveling {
     }
 }
 
+/// The loudness to master to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Target {
+    /// Integrated loudness (LUFS).
+    Lufs(f64),
+    /// As loud as the set goes while the limiter stays within its clean budget.
+    Max,
+}
+
 /// Master a DJ set: even out loudness, tame spikes, hit a target.
 #[derive(Debug, Parser)]
 #[command(name = "fadercut", version)]
@@ -63,10 +72,11 @@ pub struct Args {
     #[arg(long, value_name = "START-END", value_parser = parse_preview)]
     pub preview: Option<Clip>,
 
-    /// Override integrated loudness (LUFS)
-    #[arg(long, value_name = "LUFS", allow_negative_numbers = true,
-          value_parser = parse_finite)]
-    pub target: Option<f64>,
+    /// Override integrated loudness (LUFS), or `max`: the loudest the set goes
+    /// before the limiter audibly works
+    #[arg(long, value_name = "LUFS|max", allow_negative_numbers = true,
+          value_parser = parse_target)]
+    pub target: Option<Target>,
 
     /// Override the true-peak ceiling (dBTP, -20 to 0)
     #[arg(long, value_name = "DBTP", allow_negative_numbers = true,
@@ -93,6 +103,15 @@ fn parse_finite(s: &str) -> Result<f64, String> {
         Ok(v) if v.is_finite() => Ok(v),
         _ => Err(format!("{s:?} is not a finite number")),
     }
+}
+
+fn parse_target(s: &str) -> Result<Target, String> {
+    if s.trim().eq_ignore_ascii_case("max") {
+        return Ok(Target::Max);
+    }
+    parse_finite(s)
+        .map(Target::Lufs)
+        .map_err(|_| format!("{s:?} is not a loudness in LUFS or `max`"))
 }
 
 /// The limiter cannot be set above full scale or below about -24 dBFS.
@@ -190,8 +209,22 @@ mod tests {
     #[test]
     fn negative_targets_are_accepted() {
         let args = parse(&["set.wav", "--target", "-10", "--tp", "-1.5"]).unwrap();
-        assert_eq!((args.target, args.tp), (Some(-10.0), Some(-1.5)));
+        assert_eq!(
+            (args.target, args.tp),
+            (Some(Target::Lufs(-10.0)), Some(-1.5))
+        );
         assert!(parse(&["set.wav", "--target", "nan"]).is_err());
+    }
+
+    #[test]
+    fn target_accepts_max() {
+        let args = parse(&["set.wav", "--target", "max"]).unwrap();
+        assert_eq!(args.target, Some(Target::Max));
+        assert_eq!(
+            parse(&["set.wav", "--target=MAX"]).unwrap().target,
+            Some(Target::Max)
+        );
+        assert!(parse(&["set.wav", "--target", "loud"]).is_err());
     }
 
     #[test]

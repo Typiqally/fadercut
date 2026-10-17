@@ -9,12 +9,12 @@ use crate::analysis::{measure_timeline, LoudnessStats, MeterFile, Timeline};
 use crate::apply::{apply_envelope, Envelope};
 use crate::aup;
 use crate::chain::{self, Filter, LowEnd, RenderPlan};
-use crate::cli::Args;
+use crate::cli::{Args, Target};
 use crate::error::Error;
 use crate::ffutil::{clip_args, describe_status, find_tool, probe_audio, tail};
 use crate::ffutil::{AudioFormat, Clip};
 use crate::hotspots::{self, Hotspots, Stretch};
-use crate::landing::{land, Goal, Landing};
+use crate::landing::{land, Goal, Landing, Loudest, Pass, CLEAN_LIMITING_LU};
 use crate::leveler::{compute_gain_db, gain_to_linear, Profile, PRESERVE_LOUD_DOWN};
 use crate::presets::Preset;
 
@@ -62,6 +62,8 @@ struct Job<'a> {
     input: &'a Path,
     output: &'a Path,
     preset: Preset,
+    /// Set when the target is the loudest clean master rather than a fixed level.
+    loudest: Option<Loudest>,
     clip: Option<Clip>,
     low_end: LowEnd,
     format: AudioFormat,
@@ -71,9 +73,7 @@ struct Job<'a> {
 impl Job<'_> {
     /// What the master must measure; even-only presets keep the measured loudness.
     fn goal(&self, before: &LoudnessStats) -> Result<Goal, Error> {
-        if before.integrated <= SILENCE_LUFS {
-            return Err(Error::SilentInput);
-        }
+        reject_silence(before)?;
         let loudness = self.preset.target_i.unwrap_or_else(|| {
             log(format!(
                 "      even-only: target set to measured {:+.1} LUFS",
@@ -85,6 +85,46 @@ impl Job<'_> {
             loudness,
             ceiling_db: self.preset.target_tp,
         })
+    }
+
+    /// The first render the landing will make.
+    fn first_plan(&self, before: &LoudnessStats, extra_peak_db: f64) -> Result<RenderPlan, Error> {
+        match &self.loudest {
+            Some(loudest) => {
+                reject_silence(before)?;
+                Ok(loudest.first_plan(before, extra_peak_db))
+            }
+            None => Ok(self.goal(before)?.first_plan(before, extra_peak_db)),
+        }
+    }
+
+    /// Render until on target. Returns what the master was held to (for a loudest
+    /// search, the loudness it landed at) and the accepted render.
+    fn land(
+        &self,
+        before: &LoudnessStats,
+        extra_peak_db: f64,
+        mut render: impl FnMut(usize, &RenderPlan) -> Result<Pass, Error>,
+    ) -> Result<(Goal, Landing), Error> {
+        match &self.loudest {
+            Some(loudest) => {
+                reject_silence(before)?;
+                let landing = loudest.land(before, extra_peak_db, render)?;
+                let goal = Goal {
+                    loudness: landing.after.integrated,
+                    ceiling_db: loudest.ceiling_db,
+                };
+                Ok((goal, landing))
+            }
+            None => {
+                let goal = self.goal(before)?;
+                let first = goal.first_plan(before, extra_peak_db);
+                let landing = land(&goal, first, |attempt, plan| {
+                    render(attempt, plan).map(|pass| pass.after)
+                })?;
+                Ok((goal, landing))
+            }
+        }
     }
 
     fn low_end_peak_allowance(&self) -> f64 {
@@ -119,6 +159,13 @@ impl Job<'_> {
     fn measure(&self, file: &Path, clip: Option<Clip>) -> Result<LoudnessStats, Error> {
         Ok(measure_timeline(self.ffmpeg, file, clip)?.stats())
     }
+}
+
+fn reject_silence(before: &LoudnessStats) -> Result<(), Error> {
+    if before.integrated <= SILENCE_LUFS {
+        return Err(Error::SilentInput);
+    }
+    Ok(())
 }
 
 /// A temporary audio file written beside the final output (so that moving a finished
@@ -186,7 +233,7 @@ impl<'a> PassMeter<'a> {
         self.job.filter(plan, Some(self.tap.path()))
     }
 
-    fn measure(&mut self, plan: &RenderPlan, rendered: &Path) -> Result<LoudnessStats, Error> {
+    fn measure(&mut self, plan: &RenderPlan, rendered: &Path) -> Result<Pass, Error> {
         let rendered = measure_timeline(self.job.ffmpeg, rendered, None)?;
         let after = rendered.stats();
         self.limiter = match plan.limit_db {
@@ -200,8 +247,18 @@ impl<'a> PassMeter<'a> {
             }
             None => None,
         };
-        log(format!("              -> {}", after.summary()));
-        Ok(after)
+        let limiter_cost_lu = self.limiter.as_ref().map_or(0.0, |pass| pass.cost_lu);
+        match plan.limit_db {
+            Some(_) => log(format!(
+                "              -> {}  (limiter {limiter_cost_lu:.2} LU)",
+                after.summary()
+            )),
+            None => log(format!("              -> {}", after.summary())),
+        }
+        Ok(Pass {
+            after,
+            limiter_cost_lu,
+        })
     }
 }
 
@@ -279,6 +336,7 @@ fn report_lines(
     before: &LoudnessStats,
     landing: &Landing,
     goal: &Goal,
+    loudest: Option<&Loudest>,
     limiter_cost_lu: Option<f64>,
     preset_name: &str,
 ) -> Vec<String> {
@@ -294,12 +352,20 @@ fn report_lines(
         rule.clone(),
         format!("  before : {}", before.summary()),
         format!("  after  : {}", landing.after.summary()),
-        format!(
-            "  target : I={:+.1} LUFS  TP<={:+.1} dBTP  ({})",
-            goal.loudness,
-            goal.ceiling_db,
-            passes(landing.attempts)
-        ),
+        match loudest {
+            Some(loudest) => format!(
+                "  target : loudest with limiter <= {:.1} LU  TP<={:+.1} dBTP  ({})",
+                loudest.budget_lu,
+                goal.ceiling_db,
+                passes(landing.attempts)
+            ),
+            None => format!(
+                "  target : I={:+.1} LUFS  TP<={:+.1} dBTP  ({})",
+                goal.loudness,
+                goal.ceiling_db,
+                passes(landing.attempts)
+            ),
+        },
         format!("  limiter: {limiter}"),
         rule,
         String::new(),
@@ -398,7 +464,15 @@ fn finish(
     for warning in warnings(landing, goal, limiter_cost_lu, hotspots.as_ref()) {
         log(warning);
     }
-    for line in report_lines(before, landing, goal, limiter_cost_lu, job.preset.name) {
+    let loudest = job.loudest.as_ref();
+    for line in report_lines(
+        before,
+        landing,
+        goal,
+        loudest,
+        limiter_cost_lu,
+        job.preset.name,
+    ) {
         println!("{line}");
     }
     println!("Done: {}", job.output.display());
@@ -437,7 +511,20 @@ pub fn run(args: &Args) -> Result<(), Error> {
             output.display()
         )));
     }
-    let preset = args.preset.preset().with_overrides(args.target, args.tp);
+    let fixed_target = match args.target {
+        Some(Target::Lufs(lufs)) => Some(lufs),
+        Some(Target::Max) | None => None,
+    };
+    let preset = args.preset.preset().with_overrides(fixed_target, args.tp);
+    let loudest = (args.target == Some(Target::Max)).then_some(Loudest {
+        ceiling_db: preset.target_tp,
+        budget_lu: CLEAN_LIMITING_LU,
+    });
+    if loudest.is_some() {
+        log(format!(
+            "Target: the loudest master with the limiter taking at most {CLEAN_LIMITING_LU:.1} LU"
+        ));
+    }
     let low_end = LowEnd {
         subsonic_hz: args.subsonic,
         bass_mono_hz: args.bass_mono,
@@ -479,6 +566,7 @@ pub fn run(args: &Args) -> Result<(), Error> {
         input: source,
         output: &output,
         preset,
+        loudest,
         clip,
         low_end,
         format,
@@ -529,8 +617,8 @@ fn run_transparent(job: &Job) -> Result<(), Error> {
         before.summary(),
         started.elapsed().as_secs_f64()
     ));
-    let goal = job.goal(&before)?;
-    let first = goal.first_plan(&before, job.low_end_peak_allowance());
+    let extra_peak_db = job.low_end_peak_allowance();
+    let first = job.first_plan(&before, extra_peak_db)?;
 
     let command = |filter: &Filter, output: &Path| {
         build_render_command(
@@ -555,7 +643,7 @@ fn run_transparent(job: &Job) -> Result<(), Error> {
     log(format!("[2/2] Rendering -> {} ...", file_name(job.output)));
     let partial = ScratchFile::beside(job.output, "partial");
     let mut meter = PassMeter::new(job)?;
-    let landing = land(&goal, first, |attempt, plan| {
+    let (goal, landing) = job.land(&before, extra_peak_db, |attempt, plan| {
         log(format!("      pass {attempt}: {}", job.describe(plan)));
         let cmd = command(&meter.filter(plan), &partial.path);
         let out = Command::new(&cmd[0])
@@ -604,8 +692,6 @@ fn run_leveling(job: &Job, profile: Profile, preserve_loud: bool) -> Result<(), 
         before.summary(),
         started.elapsed().as_secs_f64()
     ));
-    let goal = job.goal(&before)?;
-
     let ride_db = compute_gain_db(
         &timeline.times,
         &timeline.short_term,
@@ -620,7 +706,8 @@ fn run_leveling(job: &Job, profile: Profile, preserve_loud: bool) -> Result<(), 
         });
     log(format!("      ride {ride_min:+.2}..{ride_max:+.2} dB"));
     // The ride's largest boost lands on top of the constant gain.
-    let first = goal.first_plan(&before, ride_max.max(0.0) + job.low_end_peak_allowance());
+    let extra_peak_db = ride_max.max(0.0) + job.low_end_peak_allowance();
+    let first = job.first_plan(&before, extra_peak_db)?;
 
     if job.dry_run {
         log(format!("\n[dry-run] before: {}", before.summary()));
@@ -640,7 +727,7 @@ fn run_leveling(job: &Job, profile: Profile, preserve_loud: bool) -> Result<(), 
     let envelope = Envelope::new(&timeline.times, &ride_lin)?;
     let partial = ScratchFile::beside(job.output, "partial");
     let mut meter = PassMeter::new(job)?;
-    let landing = land(&goal, first, |attempt, plan| {
+    let (goal, landing) = job.land(&before, extra_peak_db, |attempt, plan| {
         log(format!("      pass {attempt}: {}", job.describe(plan)));
         apply_envelope(
             job.ffmpeg,
@@ -695,6 +782,7 @@ mod tests {
             input: Path::new("/in.wav"),
             output: Path::new("/out.wav"),
             preset: preset.preset(),
+            loudest: None,
             clip: None,
             low_end,
             format: AudioFormat {
@@ -864,7 +952,7 @@ mod tests {
     #[test]
     fn report_shows_target_passes_and_limiter_cost() {
         let landed = landing(LANDED, Some(-1.2), true);
-        let lines = report_lines(&SOURCE, &landed, &CLUB_GOAL, Some(0.34), "club");
+        let lines = report_lines(&SOURCE, &landed, &CLUB_GOAL, None, Some(0.34), "club");
         assert!(lines.contains(&"  before : I=-15.2 LUFS  TP=-5.1 dBTP  LRA=4.5 LU".to_owned()));
         assert!(lines.contains(&"  after  : I=-9.1 LUFS  TP=-1.1 dBTP  LRA=4.1 LU".to_owned()));
         assert!(lines.contains(&"  target : I=-9.0 LUFS  TP<=-1.0 dBTP  (2 passes)".to_owned()));
@@ -872,9 +960,29 @@ mod tests {
     }
 
     #[test]
+    fn report_names_a_loudest_search_as_the_target() {
+        let landed = landing(LANDED, Some(-1.2), true);
+        let loudest = Loudest {
+            ceiling_db: -1.0,
+            budget_lu: 0.5,
+        };
+        let lines = report_lines(
+            &SOURCE,
+            &landed,
+            &CLUB_GOAL,
+            Some(&loudest),
+            Some(0.48),
+            "club",
+        );
+        assert!(lines.contains(
+            &"  target : loudest with limiter <= 0.5 LU  TP<=-1.0 dBTP  (2 passes)".to_owned()
+        ));
+    }
+
+    #[test]
     fn report_says_when_the_limiter_was_left_out() {
         let landed = landing(LANDED, None, true);
-        let lines = report_lines(&SOURCE, &landed, &CLUB_GOAL, None, "club");
+        let lines = report_lines(&SOURCE, &landed, &CLUB_GOAL, None, None, "club");
         assert!(lines.contains(&"  limiter: not needed".to_owned()));
     }
 

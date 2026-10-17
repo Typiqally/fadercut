@@ -38,9 +38,18 @@ pub struct Goal {
     pub ceiling_db: f64,
 }
 
+/// The limiter threshold that holds a true-peak ceiling.
+fn default_limit_db(ceiling_db: f64) -> f64 {
+    ceiling_db - LIMITER_MARGIN_DB
+}
+
+fn peak_within(ceiling_db: f64, measured: &LoudnessStats) -> bool {
+    measured.true_peak <= ceiling_db + PEAK_TOLERANCE_DB
+}
+
 impl Goal {
     fn default_limit_db(&self) -> f64 {
-        self.ceiling_db - LIMITER_MARGIN_DB
+        default_limit_db(self.ceiling_db)
     }
 
     pub fn loudness_ok(&self, measured: &LoudnessStats) -> bool {
@@ -48,7 +57,7 @@ impl Goal {
     }
 
     pub fn peak_ok(&self, measured: &LoudnessStats) -> bool {
-        measured.true_peak <= self.ceiling_db + PEAK_TOLERANCE_DB
+        peak_within(self.ceiling_db, measured)
     }
 
     /// The first attempt: the gain that would land the target if nothing were lost,
@@ -140,6 +149,188 @@ pub fn land<E>(
     }
 }
 
+/// Loudness the limiter may remove when the target is "as loud as stays clean".
+/// On hard-groove material a cost of ~0.3 LU measured clean and ~1.2 LU pumped
+/// (docs/2026-10-11-mastering-fix-plan.md); this sits between the two, below the
+/// heavy-limiting warning.
+pub const CLEAN_LIMITING_LU: f64 = 0.5;
+
+/// A loudest-clean search within this of its limiter budget has landed.
+const BUDGET_TOLERANCE_LU: f64 = 0.1;
+
+/// Renders allowed while searching, not counting a final re-render of the winner.
+pub const MAX_SEARCH_ATTEMPTS: usize = 6;
+
+/// The first probe sits this far above the gain at which the limiter idles.
+const FIRST_STEP_DB: f64 = 4.0;
+
+/// The search never goes further than this above that idle gain.
+const MAX_STEP_DB: f64 = 20.0;
+
+/// Bracket width at which the search stops refining (dB of gain).
+const MIN_BRACKET_DB: f64 = 0.1;
+
+/// One rendered attempt as measured: the file, and what the limiter took off its
+/// loudness (0 when the limiter was not in the chain).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pass {
+    pub after: LoudnessStats,
+    pub limiter_cost_lu: f64,
+}
+
+/// Aim for the loudest master whose limiter cost stays within a budget.
+///
+/// The cost only grows with gain, so the search brackets the gain at which it
+/// meets the budget and narrows in by interpolation. Below the gain at which the
+/// source's peaks first reach the limiter, the cost is zero, which gives the lower
+/// end of the bracket without a render.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Loudest {
+    /// True-peak ceiling (dBTP).
+    pub ceiling_db: f64,
+    /// Loudness the limiter may remove (LU).
+    pub budget_lu: f64,
+}
+
+/// A probed gain and its limiter cost.
+#[derive(Debug, Clone, Copy)]
+struct Probe {
+    gain_db: f64,
+    cost_lu: f64,
+}
+
+impl Loudest {
+    /// The highest gain at which the limiter is certainly idle.
+    fn idle_gain_db(&self, before: &LoudnessStats, extra_peak_db: f64) -> f64 {
+        default_limit_db(self.ceiling_db) - before.true_peak - extra_peak_db
+    }
+
+    /// The first probe; `extra_peak_db` as for [`Goal::first_plan`].
+    pub fn first_plan(&self, before: &LoudnessStats, extra_peak_db: f64) -> RenderPlan {
+        RenderPlan {
+            gain_db: self.idle_gain_db(before, extra_peak_db) + FIRST_STEP_DB,
+            limit_db: Some(default_limit_db(self.ceiling_db)),
+        }
+    }
+
+    fn within_budget(&self, cost_lu: f64) -> bool {
+        cost_lu <= self.budget_lu + BUDGET_TOLERANCE_LU
+    }
+
+    /// Where to probe next, from the highest probe within budget (`lo`) and the
+    /// lowest one over it (`hi`), if there is one yet.
+    fn next_gain(&self, idle_db: f64, lo: Probe, hi: Option<Probe>) -> f64 {
+        match hi {
+            // Interpolate between the two; keep clear of the ends so a flat or
+            // steep stretch of the curve still shrinks the bracket.
+            Some(hi) => {
+                let span = hi.gain_db - lo.gain_db;
+                let t = (self.budget_lu - lo.cost_lu) / (hi.cost_lu - lo.cost_lu);
+                lo.gain_db + span * t.clamp(0.2, 0.8)
+            }
+            // Nothing over budget yet: the cost grows faster than linearly with
+            // gain, so a straight line through the origin of the cost overshoots
+            // the budget and gives an upper end to the bracket.
+            None => {
+                let step = if lo.cost_lu > 0.01 {
+                    (lo.gain_db - idle_db) * (self.budget_lu / lo.cost_lu - 1.0)
+                } else {
+                    FIRST_STEP_DB
+                };
+                (lo.gain_db + step.clamp(MIN_BRACKET_DB, FIRST_STEP_DB)).min(idle_db + MAX_STEP_DB)
+            }
+        }
+    }
+
+    /// Render, measure and narrow in on the loudest gain within budget.
+    ///
+    /// `render` is as for [`land`], and returns the limiter cost with the
+    /// measurement. The file of the returned landing is always the last one
+    /// rendered: if the best attempt was an earlier one, it is rendered again.
+    pub fn land<E>(
+        &self,
+        before: &LoudnessStats,
+        extra_peak_db: f64,
+        mut render: impl FnMut(usize, &RenderPlan) -> Result<Pass, E>,
+    ) -> Result<Landing, E> {
+        let idle = self.idle_gain_db(before, extra_peak_db);
+        let cap_db = idle + MAX_STEP_DB;
+        let mut limit_db = default_limit_db(self.ceiling_db);
+        let mut lo = Probe {
+            gain_db: idle,
+            cost_lu: 0.0,
+        };
+        let mut hi: Option<Probe> = None;
+        // The best attempt within budget and under the ceiling, and its number.
+        let mut best: Option<(RenderPlan, Pass, usize)> = None;
+        let mut gain_db = self.first_plan(before, extra_peak_db).gain_db;
+        let mut attempts = 0;
+
+        while attempts < MAX_SEARCH_ATTEMPTS {
+            attempts += 1;
+            let plan = RenderPlan {
+                gain_db,
+                limit_db: Some(limit_db),
+            };
+            let pass = render(attempts, &plan)?;
+            if !peak_within(self.ceiling_db, &pass.after) {
+                // The limiter let a peak through: tighten it and retry this gain.
+                let overshoot = pass.after.true_peak - self.ceiling_db;
+                limit_db = (limit_db - overshoot - PEAK_RETRY_MARGIN_DB).max(MIN_LIMIT_DB);
+                continue;
+            }
+            let probe = Probe {
+                gain_db,
+                cost_lu: pass.limiter_cost_lu,
+            };
+            let better = best.map_or(true, |(b, _, _)| gain_db > b.gain_db);
+            if self.within_budget(probe.cost_lu) && better {
+                best = Some((plan, pass, attempts));
+            }
+            if (probe.cost_lu - self.budget_lu).abs() <= BUDGET_TOLERANCE_LU {
+                break;
+            }
+            if probe.cost_lu < self.budget_lu {
+                lo = probe;
+            } else {
+                hi = Some(probe);
+            }
+            if lo.gain_db >= cap_db || hi.is_some_and(|hi| hi.gain_db - lo.gain_db < MIN_BRACKET_DB)
+            {
+                break;
+            }
+            gain_db = self.next_gain(idle, lo, hi);
+        }
+
+        let plan = match best {
+            Some((plan, pass, attempt)) if attempt == attempts => {
+                return Ok(self.landed(plan, pass.after, attempts));
+            }
+            Some((plan, _, _)) => plan,
+            // Every attempt went over budget: fall back to the highest gain known
+            // to be within it.
+            None => RenderPlan {
+                gain_db: lo.gain_db,
+                limit_db: Some(limit_db),
+            },
+        };
+        attempts += 1;
+        let after = render(attempts, &plan)?.after;
+        Ok(self.landed(plan, after, attempts))
+    }
+
+    fn landed(&self, plan: RenderPlan, after: LoudnessStats, attempts: usize) -> Landing {
+        Landing {
+            plan,
+            after,
+            attempts,
+            // There is no loudness target to miss; the measured result is the answer.
+            loudness_ok: true,
+            peak_ok: peak_within(self.ceiling_db, &after),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,8 +370,8 @@ mod tests {
         }
     }
 
-    fn never_fails(stats: LoudnessStats) -> Result<LoudnessStats, ()> {
-        Ok(stats)
+    fn never_fails<T>(value: T) -> Result<T, ()> {
+        Ok(value)
     }
 
     #[test]
@@ -306,6 +497,102 @@ mod tests {
         let result = land(&CLUB, first, |_, _| {
             calls += 1;
             Err::<LoudnessStats, _>("render failed")
+        });
+        assert_eq!(result, Err("render failed"));
+        assert_eq!(calls, 1);
+    }
+
+    const LOUDEST: Loudest = Loudest {
+        ceiling_db: -1.0,
+        budget_lu: CLEAN_LIMITING_LU,
+    };
+
+    /// Limiting cost that grows with the square of the drive into the limiter, as
+    /// measured limiter cost does: rare peaks first, then the body of the music.
+    fn convex(plan: &RenderPlan, steepness: f64, overshoot_db: f64) -> Pass {
+        let peak = SOURCE.true_peak + plan.gain_db;
+        let limit = plan.limit_db.unwrap_or(f64::INFINITY);
+        let drive = (peak - limit).max(0.0);
+        let cost = steepness * drive * drive;
+        Pass {
+            after: stats(
+                SOURCE.integrated + plan.gain_db - cost,
+                if drive > 0.0 {
+                    limit + overshoot_db
+                } else {
+                    peak
+                },
+            ),
+            limiter_cost_lu: cost,
+        }
+    }
+
+    /// The gain at which `convex` costs exactly the budget, with the default limiter.
+    fn ideal_gain(steepness: f64) -> f64 {
+        LOUDEST.idle_gain_db(&SOURCE, 0.0) + (LOUDEST.budget_lu / steepness).sqrt()
+    }
+
+    #[test]
+    fn loudest_lands_on_the_limiter_budget() {
+        for steepness in [0.02, 0.1, 0.5] {
+            let mut plans = Vec::new();
+            let landing = LOUDEST
+                .land(&SOURCE, 0.0, |_, plan| {
+                    plans.push(*plan);
+                    never_fails(convex(plan, steepness, 0.0))
+                })
+                .unwrap();
+            let cost = convex(&landing.plan, steepness, 0.0).limiter_cost_lu;
+            assert!(
+                LOUDEST.within_budget(cost) && cost > LOUDEST.budget_lu - 0.2,
+                "steepness {steepness}: cost {cost}"
+            );
+            assert!((landing.plan.gain_db - ideal_gain(steepness)).abs() < 0.5);
+            assert!(landing.attempts <= MAX_SEARCH_ATTEMPTS + 1);
+            // What is reported is what was rendered last, i.e. the file on disk.
+            assert_eq!(plans.last(), Some(&landing.plan));
+            assert_eq!(plans.len(), landing.attempts);
+            assert!(landing.loudness_ok && landing.peak_ok);
+        }
+    }
+
+    #[test]
+    fn loudest_never_keeps_a_render_over_budget() {
+        // So steep that any limiting at all blows the budget.
+        let landing = LOUDEST
+            .land(&SOURCE, 0.0, |_, plan| never_fails(convex(plan, 50.0, 0.0)))
+            .unwrap();
+        let cost = convex(&landing.plan, 50.0, 0.0).limiter_cost_lu;
+        assert!(LOUDEST.within_budget(cost), "cost {cost}");
+        assert!(landing.plan.gain_db >= LOUDEST.idle_gain_db(&SOURCE, 0.0));
+    }
+
+    #[test]
+    fn loudest_tightens_a_limiter_that_overshoots_the_ceiling() {
+        let landing = LOUDEST
+            .land(&SOURCE, 0.0, |_, plan| {
+                // This limiter lets 0.4 dB through at its default threshold only.
+                let leaky = plan.limit_db == Some(default_limit_db(LOUDEST.ceiling_db));
+                never_fails(convex(plan, 0.1, if leaky { 0.4 } else { 0.0 }))
+            })
+            .unwrap();
+        assert!(landing.peak_ok);
+        assert!(landing.plan.limit_db.unwrap() < default_limit_db(LOUDEST.ceiling_db));
+    }
+
+    #[test]
+    fn loudest_reserves_headroom_for_peaks_raised_later() {
+        let plain = LOUDEST.first_plan(&SOURCE, 0.0);
+        let filtered = LOUDEST.first_plan(&SOURCE, 3.0);
+        assert!((plain.gain_db - filtered.gain_db - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loudest_stops_at_the_first_render_error() {
+        let mut calls = 0;
+        let result = LOUDEST.land(&SOURCE, 0.0, |_, _| {
+            calls += 1;
+            Err::<Pass, _>("render failed")
         });
         assert_eq!(result, Err("render failed"));
         assert_eq!(calls, 1);

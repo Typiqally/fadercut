@@ -517,6 +517,33 @@ fn heavy_limiting_is_reported_with_where_to_listen() {
 }
 
 #[test]
+fn the_loudest_target_stops_where_the_limiter_starts_to_work() {
+    let Some(fx) = Fixture::new() else { return };
+    let (source_i, source_tp) = fx.r128(&fx.input);
+    let (output, run) = fx.master("max.wav", &["--target", "max"]);
+    assert!(run.status.success(), "{}", stderr(&run));
+
+    let report = stdout(&run);
+    assert!(
+        report.contains("target : loudest with limiter <= 0.5 LU"),
+        "{report}"
+    );
+    let cost: f64 = report
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("limiter: took "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no limiter cost in:\n{report}"));
+    assert!((0.3..=0.6).contains(&cost), "limiter cost {cost} LU");
+    assert!(!stderr(&run).contains("heavy limiting"), "{}", stderr(&run));
+
+    // Louder than the source can go without limiting, and still under the ceiling.
+    let (i, tp) = fx.r128(&output);
+    assert!(i > source_i + (-1.0 - source_tp), "landed at {i} LUFS");
+    assert!(tp <= -0.9, "true peak {tp} dBTP over the -1 ceiling");
+}
+
+#[test]
 fn a_clean_master_has_no_listening_guide() {
     let Some(fx) = Fixture::new() else { return };
     let (_, run) = fx.master("clean.wav", &["--preset", "streaming", "--target", "-24"]);
